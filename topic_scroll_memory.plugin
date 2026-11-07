@@ -1,8 +1,8 @@
 __id__ = "topic_scroll_memory"
 __name__ = "Topic Scroll Memory"
-__description__ = "Switching between topics with the topic tabs keeps your place: going back to a topic opens it exactly where you left it, the way stock already does when you open a chat from the chat list. A topic you left at the very bottom opens at the bottom as usual. Made by [firestarter1996](https://github.com/firestarter1996)."
+__description__ = "Switching between topics with the topic tabs keeps your place: going back to a topic opens it exactly where you left it, the way stock already does when you open a chat from the chat list. A topic you left at the very bottom opens at the bottom as usual. Sending a message while scrolled up keeps you where you were reading; at the bottom, sending stays at the bottom as usual. Made by [firestarter1996](https://github.com/firestarter1996)."
 __author__ = "firestarter1996"
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 # Why: stock Telegram remembers where you were in a chat or topic (the "diditem" message id and
 # offset it saves when the chat screen pauses) and opens there next time. Switching topics with
@@ -18,6 +18,10 @@ __version__ = "1.0.0"
 #   * setThreadMessages, only when a tab switch happens on an open chat screen: if the new topic has
 #     a saved position, the load starts around that message with that offset, exactly as stock does
 #     when it opens a chat from the chat list.
+# 1.0.1 (owner 11-07-2026: "should also prevent scrolling to bottom on message send"): when your own
+#   new message arrives in processNewMessages while the list is scrolled up, stock's jump to the last
+#   message (moveScrollToLastMessage) is skipped for that one call, so you stay where you were reading.
+#   At the bottom nothing changes. Two hooks, once per batch of new messages, nothing per frame.
 # Logcat tag: TopicScrollMemory.
 
 from java import jclass, dynamic_proxy
@@ -98,6 +102,7 @@ class TopicScrollMemoryPlugin(BasePlugin):
         return [
             Header(text="Topic Scroll Memory"),
             Switch(key="enabled", text="Keep my place when switching topics", default=True),
+            Switch(key="stay_on_send", text="Stay in place when I send while scrolled up", default=True),
         ]
 
     def on_plugin_load(self):
@@ -141,6 +146,36 @@ class TopicScrollMemoryPlugin(BasePlugin):
                     _log("restore: %s" % e)
 
         self._switching = False
+        self._hold = False
+
+        class NewHook(MethodHook):
+            def before_hooked_method(self, param):
+                plugin._hold = False
+                try:
+                    if bool(plugin.get_setting("stay_on_send", True)):
+                        plugin._hold = plugin._scrolled_up_send(param.thisObject, param.args[0])
+                except Exception as e:
+                    _log("send check: %s" % e)
+
+            def after_hooked_method(self, param):
+                if plugin._hold:
+                    plugin._hold = False
+                    try:
+                        plugin.fields["forceScrollToTop"].setBoolean(param.thisObject, False)
+                    except Exception:
+                        pass
+
+        class MoveHook(MethodHook):
+            def before_hooked_method(self, param):
+                if plugin._hold:
+                    param.setResult(None)     # stay where the reader is
+
+        self.fields["forceScrollToTop"] = ca.getDeclaredField("forceScrollToTop")
+        self.fields["forceScrollToTop"].setAccessible(True)
+        arr_t = find_class("java.util.ArrayList")
+        bool_t = jclass("java.lang.Boolean").TYPE
+        self.hook_method(ca.getDeclaredMethod("processNewMessages", arr_t, bool_t), NewHook())
+        self.hook_method(ca.getDeclaredMethod("moveScrollToLastMessage", bool_t), MoveHook())
         self.hook_method(ca.getDeclaredMethod("saveDraft"), SaveHook())
         arr = find_class("java.util.ArrayList")
         chat_cls = find_class("org.telegram.tgnet.TLRPC$Chat")
@@ -149,6 +184,25 @@ class TopicScrollMemoryPlugin(BasePlugin):
         self.hook_method(ca.getDeclaredMethod("setThreadMessages", arr, chat_cls, int_t, int_t, int_t, topic_cls),
                          SwitchHook())
         _log("loaded %s" % __version__)
+
+    def _scrolled_up_send(self, chat, arr):
+        """True when one of the new messages is mine and the list is not at the bottom."""
+        if arr is None:
+            return False
+        mine = False
+        for i in range(int(arr.size())):
+            m = arr.get(i)
+            if m is not None and bool(m.isOut()):
+                mine = True
+                break
+        if not mine:
+            return False
+        lv = get_private_field(chat, "chatListView")
+        lm = get_private_field(chat, "chatLayoutManager")
+        if lv is None or lm is None:
+            return False
+        pos = int(lm.findFirstVisibleItemPosition())
+        return pos > 0 or bool(lv.canScrollVertically(1))
 
     def _keys(self, chat):
         key = str(self.NC.getSharedPrefKey(chat.getDialogId(), chat.getTopicId()))
