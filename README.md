@@ -6,7 +6,7 @@ A Nagram XF plugin that keeps your place in every forum topic. Stock XF remember
 
 1. Download `topic_scroll_memory.plugin` from the latest release.
 2. Send it to yourself in Nagram XF and tap it, or open it from Settings, Plugins.
-3. Turn it on. Settings: one switch, "Keep my place when switching topics".
+3. Turn it on. Settings: "Keep my place when switching topics" and "Stay in place when I send while scrolled up", both on.
 
 ## How it behaves
 
@@ -14,6 +14,7 @@ A Nagram XF plugin that keeps your place in every forum topic. Stock XF remember
 * Leave a topic at the very bottom: it opens at the bottom as usual, with new messages showing.
 * New messages that arrived while you were away do not move you; the scroll to bottom button shows them.
 * Opening a topic from the chat list works the same as stock, since it uses the same saved place.
+* Send a message while scrolled up and you stay where you were reading; your message lands below and the scroll to bottom button shows it. At the bottom, sending keeps you at the bottom as usual (1.0.1, its own switch in the settings).
 
 ## Speed
 
