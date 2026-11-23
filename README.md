@@ -6,19 +6,22 @@ A Nagram XF plugin that keeps your place in every forum topic. Stock XF remember
 
 1. Download `topic_scroll_memory.plugin` from the latest release.
 2. Send it to yourself in Nagram XF and tap it, or open it from Settings, Plugins.
-3. Turn it on. Settings: "Keep my place when switching topics" and "Stay in place when I send while scrolled up", both on.
+3. Turn it on. Settings, all on by default: "Keep my place when switching topics", "Stay in place when I send while scrolled up", "Hold my place when replies arrive" and "Reopen where I was after XF closes".
 
 ## How it behaves
 
 * Leave a topic part way up, open another tab, come back: you are where you were.
-* Leave a topic at the very bottom: it opens at the bottom as usual, with new messages showing.
-* New messages that arrived while you were away do not move you; the scroll to bottom button shows them.
+* Leave a topic at the very bottom: it opens at the bottom.
+* Topics made of messages taller than the screen (a status panel, a long report) keep your place too, read by the pixel; stock drops the place whenever the bottom message is on screen, which in such a topic is always (1.1.1).
+* A message you were reading that got deleted and posted again (a bot that reposts its panel) is followed to its new copy, at the same spot; deleted for good, you land on the nearest surviving message at that spot. This works on return and while you are looking at the topic (1.1.1).
+* New messages that arrived while you were away, or arrive while you read, do not move you; the scroll to bottom button counts them (1.1.0).
+* Switch to another app and back, or come back after Android closed XF: same message, same spot (1.1.0).
 * Opening a topic from the chat list works the same as stock, since it uses the same saved place.
 * Send a message while scrolled up and you stay where you were reading; your message lands below and the scroll to bottom button shows it. At the bottom, sending keeps you at the bottom as usual (1.0.1, its own switch in the settings).
 
 ## Speed
 
-Nothing runs while you scroll or while anything draws. The plugin does its work once when you leave a topic (it saves the bottom message and its offset with the app's own keys) and once when the next topic opens (the app loads around that message, the same way it opens a chat from the chat list). A one time check after that load lines the message up to the exact pixel and then removes itself.
+Nothing runs while you scroll or while anything draws. The plugin does its work once when you leave a topic (it saves the bottom message and its offset with the app's own keys) and once when the next topic opens (the app loads around that message, the same way it opens a chat from the chat list). A one time check after that load lines the message up to the exact pixel for at most 1.5 seconds and then removes itself. A deletion is checked only when the message at the bottom of your screen is the one being deleted.
 
 ## Star History
 
