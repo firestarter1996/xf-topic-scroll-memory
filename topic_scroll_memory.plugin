@@ -2,7 +2,7 @@ __id__ = "topic_scroll_memory"
 __name__ = "Topic Scroll Memory"
 __description__ = "Switching between topics with the topic tabs keeps your place: going back to a topic opens it exactly where you left it, the way stock already does when you open a chat from the chat list. A topic you left at the very bottom opens at the bottom as usual. Sending a message while scrolled up keeps you where you were reading; at the bottom, sending stays at the bottom as usual. Made by [firestarter1996](https://github.com/firestarter1996)."
 __author__ = "firestarter1996"
-__version__ = "1.0.1"
+__version__ = "1.1.1"
 
 # Why: stock Telegram remembers where you were in a chat or topic (the "diditem" message id and
 # offset it saves when the chat screen pauses) and opens there next time. Switching topics with
@@ -22,6 +22,28 @@ __version__ = "1.0.1"
 #   new message arrives in processNewMessages while the list is scrolled up, stock's jump to the last
 #   message (moveScrollToLastMessage) is skipped for that one call, so you stay where you were reading.
 #   At the bottom nothing changes. Two hooks, once per batch of new messages, nothing per frame.
+# 1.1.0 (owner 11-23-2026: "When I load a different app than xf, and then go back to it, the screen position has
+#   changed ... Screen / msg position shouldn't change when I swipe back into it, even if you respond."). Cause, in
+#   stock processNewMessages: a message arriving while the chat screen is paused and the list sits at the bottom sets
+#   scrollToTopOnResume (plus an unread divider to jump to), and onResume then scrolls to that divider or to the last
+#   message. On screen, a new reply at the bottom also scrolls the list to it. "Hold my place when replies arrive"
+#   (on by default): for a batch with no message of mine, those flags are cleared and the jump is skipped, the bottom
+#   row he was reading is pinned at the same pixel, and the scroll to bottom button counts the new ones.
+#   "Reopen where I was after XF closes" (on by default): after stock's own pause save (which drops the place when
+#   you are at the bottom or the bottom row is unread), the bottom row and its offset are saved with stock's keys for
+#   every normal chat and topic, so a chat reopened after Android closed XF opens on the same message.
+#   Hooks: processNewMessages (once per batch) and onPause (once per leave). Nothing per frame.
+# 1.1.1 (owner 11-23-2026: "Every time I go back to usage topic, its about halfway up the thread, not where it was when I
+#   switched topics"). Cause, proven on the 6 Pro: the save on a tab switch copied stock's rule "bottom message on screen =
+#   no saved place". In the Usage topic every message is taller than the screen, so the bottom message is always on
+#   screen and nothing was ever saved; with no saved place XF loads a short topic at its first message (the top of the
+#   credit panel). Now the bottom row and its offset are always saved (a flag notes the very bottom), and the restore
+#   checks the result once the messages are in: saved message there = put back at the same pixel (checked for 1.5 s, since
+#   stock still shifts the list after its first layout); saved message deleted = the very bottom when he was at the very
+#   bottom; when it and every message below it were replaced (the usage panel reposts its pair), the message now at the
+#   same place from the end, at the same pixel; else the nearest older surviving message at that pixel. The bottom row
+#   is now read by pixel from the laid out rows (adapter positions named rows off screen in a topic of tall messages).
+#   Never moves the list after 1.5 s or 40 layouts, never runs per frame.
 # Logcat tag: TopicScrollMemory.
 
 from java import jclass, dynamic_proxy
@@ -30,6 +52,16 @@ from hook_utils import find_class, get_private_field, set_private_field
 from ui.settings import Header, Switch
 
 LOG_TAG = "TopicScrollMemory"
+DEBUG = False
+
+
+def _prefix(mo):
+    """The first words of a message, to find its reposted copy (the usage panel reposts the same text)."""
+    try:
+        t = mo.messageText
+        return str(t)[:32] if t is not None else ""
+    except Exception:
+        return ""
 
 
 def _log(msg):
@@ -40,16 +72,29 @@ def _log(msg):
 
 
 class _Settle(dynamic_proxy(jclass("android.view.ViewTreeObserver$OnGlobalLayoutListener"))):
-    """One shot, after a restore: once the saved message is laid out, move the list by the few
-    pixels stock's open from position lands off, then remove itself (at most 40 layouts)."""
+    """One shot, after a restore: once the topic's messages are in, put the saved message back at the saved pixel,
+    or, when it was deleted meanwhile, the right surviving message at that spot; then remove itself (at most 40 layouts)."""
 
-    def __init__(self, plugin, lv, mid, bottom):
+    def __init__(self, plugin, chat, lv, mid, bottom, at_end, tail, top=-1000000, prefix=""):
         super().__init__()
+        self.top = top
+        self.prefix = prefix or ""
+        self.topic = int(chat.getTopicId())
         self.plugin = plugin
+        self.chat = chat
         self.lv = lv
         self.mid = mid
         self.bottom = bottom
+        self.at_end = at_end
+        try:
+            self.tail = None if tail in ("-", "", "None") else [int(x) for x in tail.split(",") if x]
+        except Exception:
+            self.tail = None
         self.left = 40
+        self.jumped = False
+        self.seen = 0
+        self.fixes = 0
+        self.gone_done = False
 
     def run_once(self):
         try:
@@ -57,40 +102,139 @@ class _Settle(dynamic_proxy(jclass("android.view.ViewTreeObserver$OnGlobalLayout
         except Exception:
             pass
 
+    def _row(self, m):
+        lv = self.lv
+        for i in range(int(lv.getChildCount())):
+            v = lv.getChildAt(i)
+            if not (self.plugin.cell_cls.isInstance(v) or self.plugin.action_cls.isInstance(v)):
+                continue
+            mo = v.getMessageObject()
+            if mo is not None and int(mo.getId()) == m:
+                return v
+        return None
+
+    def _put(self, idx, bottom):
+        """Message at index idx of chat.messages with its bottom edge at pixel `bottom` of the list."""
+        adapter = get_private_field(self.chat, "chatAdapter")
+        lm = get_private_field(self.chat, "chatLayoutManager")
+        if adapter is None or lm is None:
+            return False
+        start = int(get_private_field(adapter, "messagesStartRow"))
+        if start < 0 or idx < 0:
+            return False
+        lv = self.lv
+        off = int(lv.getMeasuredHeight()) - int(bottom) - int(lv.getPaddingBottom())
+        lm.scrollToPositionWithOffset(start + idx, off)
+        return True
+
+    def _copy(self, msgs, n):
+        """Index of the newest other message that opens with the saved words, or -1."""
+        for i in range(n):
+            m = msgs.get(i)
+            if m is not None and int(m.getId()) > 0 and int(m.getId()) != self.mid and _prefix(m) == self.prefix:
+                return i
+        return -1
+
     def onGlobalLayout(self):
         self.left -= 1
         if self.left <= 0:
             self.run_once()
             return
         try:
-            lv = self.lv
-            lo = hi = None
-            for i in range(int(lv.getChildCount())):
-                v = lv.getChildAt(i)
-                if not (self.plugin.cell_cls.isInstance(v) or self.plugin.action_cls.isInstance(v)):
-                    continue
-                mo = v.getMessageObject()
-                if mo is None or int(mo.getId()) <= 0:
-                    continue
-                m = int(mo.getId())
-                if m == self.mid:
-                    dy = int(v.getBottom()) - self.bottom
-                    self.run_once()
-                    if dy != 0:
-                        lv.scrollBy(0, dy)
-                    return
-                lo = m if lo is None else min(lo, m)
-                hi = m if hi is None else max(hi, m)
-            if lo is None:
+            chat = self.chat
+            if bool(get_private_field(chat, "firstLoading")) or not bool(get_private_field(chat, "firstMessagesLoaded")):
                 return      # still loading: wait for the next layout
-            # the saved message is not on screen yet: move half a screen toward it (newer = lower)
-            half = int(lv.getMeasuredHeight()) // 2
-            if self.mid > hi:
-                lv.scrollBy(0, half)
-            elif self.mid < lo:
-                lv.scrollBy(0, -half)
+            msgs = get_private_field(chat, "messages")
+            if msgs is None or int(msgs.size()) == 0 or int(chat.getTopicId()) != self.topic:
+                return
+            m0 = next((msgs.get(i) for i in range(min(int(msgs.size()), 8))
+                       if msgs.get(i) is not None and int(msgs.get(i).getId()) > 0), None)
+            if m0 is None or int(m0.getTopicId()) != self.topic:
+                return      # the list still holds the topic we came from
+            present = False
+            for i in range(int(msgs.size())):
+                m = msgs.get(i)
+                if m is not None and int(m.getId()) == self.mid:
+                    present = True
+                    break
+            v = self._row(self.mid) if present else None     # a deleted row can still be on screen, fading out
+            if v is not None:
+                # stock can still move the list after the first layout (its open from position adds its own
+                # offsets), so the row is checked on the following layouts too, for at most 1.5 s after it showed
+                now = int(jclass("android.os.SystemClock").uptimeMillis())
+                if self.seen == 0:
+                    self.seen = now
+                if now - self.seen > 1500 or self.fixes > 6:
+                    self.run_once()     # never moves the list after that: his own scrolling is his
+                    _log("put back message %d (%d corrections)" % (self.mid, self.fixes))
+                    return
+                dy = int(v.getBottom()) - self.bottom
+                if not self.at_end and self.top != -1000000 and self.bottom - self.top > int(self.lv.getMeasuredHeight()):
+                    dy = int(v.getTop()) - self.top     # taller than the screen: its top holds the place, so an
+                                                        # edit that adds or drops lines at its end moves nothing
+                if dy != 0:
+                    self.lv.scrollBy(0, dy)
+                    self.fixes += 1
+                return
+            if self.jumped:
+                return      # moved last layout: check again once the new rows are laid out
+            n = int(msgs.size())
+            ids = []
+            for i in range(n):
+                m = msgs.get(i)
+                ids.append(int(m.getId()) if m is not None else 0)
+            if self.mid in ids:
+                self.jumped = self._put(ids.index(self.mid), self.bottom)
+                if not self.jumped:
+                    self.run_once()
+                return
+            # the saved message is gone (deleted, or the panel was reposted)
+            if self.gone_done:
+                self.run_once()
+                return
+            self.gone_done = True
+            newest = next((i for i in range(n) if ids[i] > 0), -1)
+            if newest < 0:
+                self.run_once()
+                return
+            pick = -1
+            if self.at_end:
+                self.run_once()
+                self._put(newest, int(self.lv.getMeasuredHeight()) - int(self.lv.getPaddingBottom()))
+                how = "bottom"
+            elif len(self.prefix) >= 8 and self._copy(msgs, n) >= 0:
+                # its reposted copy (same opening words, same height) is in the topic: that copy, same pixels
+                pick = self._copy(msgs, n)
+                how = "reposted copy %d" % ids[pick]
             else:
-                self.run_once()     # it is between rows on screen (deleted or hidden): stock's place stands
+                self.top = -1000000     # another message: its bottom edge goes where the saved one's was
+                if self.tail is not None and not any(t in ids for t in self.tail):
+                    # it and every message below it were replaced: the message now at the same place from the end
+                    pos = [i for i in range(n) if ids[i] > 0]
+                    if len(self.tail) < len(pos):
+                        pick = pos[len(self.tail)]
+                    how = "same place from the end"
+                else:
+                    older = [i for i in range(n) if 0 < ids[i] < self.mid]
+                    newer = [i for i in range(n) if ids[i] > self.mid]
+                    pick = older[0] if older else (newer[-1] if newer else -1)
+                    how = "nearest"
+                if pick < 0:
+                    self.run_once()
+                    return
+                how += " %d" % ids[pick]
+            if pick >= 0:
+                old = self.mid
+                self.mid = ids[pick]      # follow that message for the next layouts, same 1.5 s check
+                self.seen = 0
+                self.fixes = 0
+                self.left = 40
+                self.jumped = self._put(pick, self.bottom)
+                if not self.jumped:
+                    self.run_once()
+                _log("saved message %d gone, placed %s" % (old, how))
+                return
+            _log("saved message %d gone, placed %s" % (self.mid, how))
         except Exception as e:
             _log("settle: %s" % e)
             self.run_once()
@@ -103,6 +247,8 @@ class TopicScrollMemoryPlugin(BasePlugin):
             Header(text="Topic Scroll Memory"),
             Switch(key="enabled", text="Keep my place when switching topics", default=True),
             Switch(key="stay_on_send", text="Stay in place when I send while scrolled up", default=True),
+            Switch(key="hold_on_reply", text="Hold my place when replies arrive", default=True),
+            Switch(key="reopen_place", text="Reopen where I was after XF closes", default=True),
         ]
 
     def on_plugin_load(self):
@@ -151,11 +297,20 @@ class TopicScrollMemoryPlugin(BasePlugin):
         class NewHook(MethodHook):
             def before_hooked_method(self, param):
                 plugin._hold = False
+                plugin._reply = None
                 try:
                     if bool(plugin.get_setting("stay_on_send", True)):
                         plugin._hold = plugin._scrolled_up_send(param.thisObject, param.args[0])
                 except Exception as e:
                     _log("send check: %s" % e)
+                try:
+                    if not plugin._hold and bool(plugin.get_setting("hold_on_reply", True)):
+                        plugin._reply = plugin._reply_before(param.thisObject, param.args[0])
+                        if plugin._reply is not None and not plugin._reply[5]:
+                            plugin._hold = True      # on screen: skip stock's jump to the new reply
+                except Exception as e:
+                    plugin._reply = None
+                    _log("reply check: %s" % e)
 
             def after_hooked_method(self, param):
                 if plugin._hold:
@@ -164,6 +319,13 @@ class TopicScrollMemoryPlugin(BasePlugin):
                         plugin.fields["forceScrollToTop"].setBoolean(param.thisObject, False)
                     except Exception:
                         pass
+                r = plugin._reply
+                plugin._reply = None
+                if r is not None:
+                    try:
+                        plugin._reply_after(param.thisObject, r, param.args[0])
+                    except Exception as e:
+                        _log("reply hold: %s" % e)
 
         class MoveHook(MethodHook):
             def before_hooked_method(self, param):
@@ -177,12 +339,115 @@ class TopicScrollMemoryPlugin(BasePlugin):
         self.hook_method(ca.getDeclaredMethod("processNewMessages", arr_t, bool_t), NewHook())
         self.hook_method(ca.getDeclaredMethod("moveScrollToLastMessage", bool_t), MoveHook())
         self.hook_method(ca.getDeclaredMethod("saveDraft"), SaveHook())
+
+        class ResumeHook(MethodHook):
+            def before_hooked_method(self, param):
+                # stock's onResume jumps to the last message (or the unread divider) when scrollToTopOnResume is set;
+                # it can be set by an earlier batch or a load while away. Coming back to a screen that was already
+                # open, the place stays, unless the newest message is mine (then stock's jump to it is kept).
+                try:
+                    chat = param.thisObject
+                    k = int(chat.hashCode())
+                    if k not in plugin._left:
+                        return
+                    plugin._left.discard(k)
+                    if not bool(plugin.get_setting("hold_on_reply", True)):
+                        return
+                    f = plugin.fields
+                    if not bool(f["scrollToTopOnResume"].getBoolean(chat)):
+                        return
+                    msgs = get_private_field(chat, "messages")
+                    if msgs is not None:
+                        for i in range(min(int(msgs.size()), 8)):
+                            m = msgs.get(i)
+                            if m is not None and int(m.getId()) != 0:
+                                if bool(m.isOut()):
+                                    return
+                                break
+                    f["scrollToTopOnResume"].setBoolean(chat, False)
+                    f["scrollToTopUnReadOnResume"].setBoolean(chat, False)
+                    plugin._nlog = getattr(plugin, "_nlog", 0) + 1
+                    if plugin._nlog <= 30:
+                        _log("resume: kept the place")
+                except Exception as e:
+                    _log("resume: %s" % e)
+
+        self._left = set()
+
+        class PauseHook(MethodHook):
+            def after_hooked_method(self, param):
+                try:
+                    if len(plugin._left) > 200:
+                        plugin._left.clear()
+                    if bool(get_private_field(param.thisObject, "firstMessagesLoaded")):
+                        plugin._left.add(int(param.thisObject.hashCode()))
+                except Exception:
+                    pass
+                try:
+                    if bool(plugin.get_setting("reopen_place", True)):
+                        plugin._save_any(param.thisObject)
+                except Exception as e:
+                    _log("pause save: %s" % e)
+
+        self._reply = None
+        for name in ("scrollToTopOnResume", "scrollToTopUnReadOnResume", "paused", "newUnreadMessageCount",
+                     "canShowPagedownButton", "chatMode"):
+            try:
+                fl = ca.getDeclaredField(name)
+                fl.setAccessible(True)
+                self.fields[name] = fl
+            except Exception as e:
+                _log("field %s: %s" % (name, e))
+        try:
+            self.upd_pd = ca.getDeclaredMethod("updatePagedownButtonVisibility", bool_t)
+            self.upd_pd.setAccessible(True)
+        except Exception:
+            self.upd_pd = None
+        try:
+            self.side_cls = find_class("org.telegram.ui.ChatActivitySideControlsButtonsLayout")
+            self.btn_pd = int(self.side_cls.getField("BUTTON_PAGE_DOWN").getInt(None))
+        except Exception:
+            self.btn_pd = None
+        self.hook_method(ca.getDeclaredMethod("onPause"), PauseHook())
+        self.hook_method(ca.getDeclaredMethod("onResume"), ResumeHook())
         arr = find_class("java.util.ArrayList")
         chat_cls = find_class("org.telegram.tgnet.TLRPC$Chat")
         topic_cls = find_class("org.telegram.tgnet.TLRPC$TL_forumTopic")
         int_t = jclass("java.lang.Integer").TYPE
         self.hook_method(ca.getDeclaredMethod("setThreadMessages", arr, chat_cls, int_t, int_t, int_t, topic_cls),
                          SwitchHook())
+        class DelHook(MethodHook):
+            # 1.1.1: the message at the bottom edge is deleted while the topic is open (the usage panel reposts its
+            # pair: new copy first, then the old one is deleted): the view stays on the same words, same pixels
+            def before_hooked_method(self, param):
+                plugin._del = None
+                try:
+                    if bool(plugin.get_setting("enabled", True)):
+                        plugin._del = plugin._del_before(param.thisObject, param.args[0])
+                except Exception as e:
+                    _log("delete check: %s" % e)
+
+            def after_hooked_method(self, param):
+                d = plugin._del
+                plugin._del = None
+                if d is None:
+                    return
+                try:
+                    chat = param.thisObject
+                    lv = get_private_field(chat, "chatListView")
+                    if lv is not None:
+                        mid, off, bottom, at_end, tail, top, prefix = d
+                        lv.getViewTreeObserver().addOnGlobalLayoutListener(
+                            _Settle(plugin, chat, lv, mid, bottom, at_end, tail, top, prefix))
+                except Exception as e:
+                    _log("delete hold: %s" % e)
+
+        self._del = None
+        try:
+            long_t = jclass("java.lang.Long").TYPE
+            self.hook_method(ca.getDeclaredMethod("processDeletedMessages", arr, long_t, bool_t, bool_t, bool_t), DelHook())
+        except Exception as e:
+            _log("delete hook not set: %s" % e)
         _log("loaded %s" % __version__)
 
     def _scrolled_up_send(self, chat, arr):
@@ -204,12 +469,191 @@ class TopicScrollMemoryPlugin(BasePlugin):
         pos = int(lm.findFirstVisibleItemPosition())
         return pos > 0 or bool(lv.canScrollVertically(1))
 
+    def _bottom_row(self, chat):
+        """The message row at the bottom edge of the visible list: (message object, its view) or (None, None).
+        1.1.1: read from the laid out children by pixel (a row taller than the screen counts while it covers the
+        bottom edge), not from adapter positions, which in a topic of very tall messages named rows off screen."""
+        lv = get_private_field(chat, "chatListView")
+        if lv is None:
+            return None, None
+        edge = int(lv.getMeasuredHeight()) - int(lv.getPaddingBottom())
+        best = None
+        if DEBUG:
+            _log("rows h=%d pb=%d: %s" % (int(lv.getMeasuredHeight()), int(lv.getPaddingBottom()), ", ".join(
+                "%s/%d/%d" % (type(lv.getChildAt(i)).__name__ if False else str(lv.getChildAt(i).getClass().getSimpleName()),
+                              int(lv.getChildAt(i).getTop()), int(lv.getChildAt(i).getBottom())) +
+                ("#%d" % int(lv.getChildAt(i).getMessageObject().getId()) if (self.cell_cls.isInstance(lv.getChildAt(i)) or self.action_cls.isInstance(lv.getChildAt(i))) and lv.getChildAt(i).getMessageObject() is not None else "")
+                for i in range(int(lv.getChildCount())))))
+        for i in range(int(lv.getChildCount())):
+            v = lv.getChildAt(i)
+            if not (self.cell_cls.isInstance(v) or self.action_cls.isInstance(v)):
+                continue
+            mo = v.getMessageObject()
+            if mo is None or int(mo.getId()) <= 0:
+                continue
+            top, bot = int(v.getTop()), int(v.getBottom())
+            if top >= edge or bot <= 0:
+                continue        # not on screen
+            if top < edge <= bot:
+                return mo, v    # covers the bottom edge
+            if best is None or bot > int(best[1].getBottom()):
+                best = (mo, v)
+        return best if best is not None else (None, None)
+
+    def _del_before(self, chat, arr):
+        """The place, when the row at the bottom edge is among the messages being deleted; else None."""
+        if arr is None or int(arr.size()) == 0 or int(self.fields["chatMode"].getInt(chat)) != 0:
+            return None
+        if bool(get_private_field(chat, "firstLoading")) or not bool(get_private_field(chat, "firstMessagesLoaded")):
+            return None
+        mo, v = self._bottom_row(chat)
+        if mo is None:
+            return None
+        mid = int(mo.getId())
+        hit = False
+        for i in range(int(arr.size())):
+            x = arr.get(i)
+            if x is not None and int(x) == mid:
+                hit = True
+                break
+        if not hit:
+            return None
+        place = self._place(chat)
+        if place is None:
+            return None
+        mid, off, bottom, at_end, tail = place
+        return (mid, off, bottom, at_end, tail, int(getattr(self, "_last_top", -1000000)), str(getattr(self, "_last_prefix", "")))
+
+    def _reply_before(self, chat, arr):
+        """A batch with no message of mine on a loaded chat: what the hold needs, else None.
+        (message, offset for scrollToPositionWithOffset, unread count, sotr flag, incoming count, paused)"""
+        if arr is None or int(arr.size()) == 0:
+            return None
+        if int(self.fields["chatMode"].getInt(chat)) != 0:
+            return None
+        if bool(get_private_field(chat, "firstLoading")) or not bool(get_private_field(chat, "firstMessagesLoaded")):
+            return None
+        incoming = 0
+        for i in range(int(arr.size())):
+            m = arr.get(i)
+            if m is None:
+                continue
+            if bool(m.isOut()):
+                return None       # mine: stock's send rules (and stay_on_send) decide
+            incoming += 1
+        if incoming == 0:
+            return None
+        mo, v = self._bottom_row(chat)
+        if mo is None:
+            return None
+        lv = get_private_field(chat, "chatListView")
+        off = int(lv.getMeasuredHeight()) - int(v.getBottom()) - int(lv.getPaddingBottom())
+        return (mo, off, int(self.fields["newUnreadMessageCount"].getInt(chat)),
+                bool(self.fields["scrollToTopOnResume"].getBoolean(chat)), incoming,
+                bool(self.fields["paused"].getBoolean(chat)))
+
+    def _reply_after(self, chat, r, arr):
+        mo, off, unread_before, sotr_before, incoming, paused = r
+        f = self.fields
+        if paused and not sotr_before and bool(f["scrollToTopOnResume"].getBoolean(chat)):
+            f["scrollToTopOnResume"].setBoolean(chat, False)      # no jump on resume
+            f["scrollToTopUnReadOnResume"].setBoolean(chat, False)
+        msgs = get_private_field(chat, "messages")
+        added = 0
+        if msgs is not None and arr is not None:
+            for i in range(int(arr.size())):
+                if int(msgs.indexOf(arr.get(i))) >= 0:
+                    added += 1
+        if added == 0:
+            return      # the batch was for another topic or chat: nothing on this screen changed
+        incoming = added
+        adapter = get_private_field(chat, "chatAdapter")
+        lm = get_private_field(chat, "chatLayoutManager")
+        idx = int(msgs.indexOf(mo)) if msgs is not None else -1
+        if idx >= 0 and adapter is not None and lm is not None:
+            start = int(get_private_field(adapter, "messagesStartRow"))
+            if start >= 0:
+                lm.scrollToPositionWithOffset(start + idx, off)    # the row he was reading stays put
+        n = int(f["newUnreadMessageCount"].getInt(chat))
+        if n < unread_before + incoming:
+            n = unread_before + incoming
+            f["newUnreadMessageCount"].setInt(chat, n)
+        side = get_private_field(chat, "sideControlsButtonsLayout")
+        if side is not None and self.btn_pd is not None:
+            side.setButtonCount(self.btn_pd, n, True)
+        f["canShowPagedownButton"].setBoolean(chat, True)
+        if self.upd_pd is not None:
+            self.upd_pd.invoke(chat, True)
+        self._nlog = getattr(self, "_nlog", 0) + 1
+        if self._nlog <= 30:      # a short record of the first holds, for the proof run
+            _log("hold %s: row %d kept at %d, %d new" % ("paused" if paused else "on screen", idx, off, incoming))
+
+    def _place(self, chat):
+        """The bottom message row on screen and where it sits, or None:
+        (message id, offset as stock saves it, row bottom pixel, at the very bottom, it is the newest loaded message)."""
+        mo, v = self._bottom_row(chat)
+        if mo is None:
+            return None
+        lv = get_private_field(chat, "chatListView")
+        if lv is None:
+            return None
+        mid = int(mo.getId())
+        bottom = int(v.getBottom())
+        self._last_top = int(v.getTop())
+        self._last_prefix = _prefix(mo)
+        at_end = not bool(lv.canScrollVertically(1))
+        newer = []          # ids of the messages below it (newest first), only when there are a few
+        msgs = get_private_field(chat, "messages")
+        if msgs is not None:
+            for i in range(min(int(msgs.size()), 12)):
+                m = msgs.get(i)
+                if m is None or int(m.getId()) <= 0:
+                    continue
+                if int(m.getId()) == mid:
+                    break
+                newer.append(int(m.getId()))
+            else:
+                newer = None    # far up in a busy topic: no tail to follow
+        newest = ",".join(str(x) for x in newer) if newer is not None else "-"
+        return mid, bottom - int(lv.getMeasuredHeight()), bottom, at_end, newest
+
+    def _write(self, chat, place):
+        k_id, k_off, k_b, k_end, k_new = self._keys(chat)
+        prefs = self.MC.getNotificationsSettings(int(chat.getCurrentAccount())).edit()
+        if place is None:
+            prefs.remove(k_id).remove(k_off).remove(k_b).remove(k_b + "t").remove(k_b + "x").remove(k_end).remove(k_new)
+        else:
+            mid, off, bottom, at_end, newest = place
+            prefs.putInt(k_id, mid).putInt(k_off, off).putInt(k_b, bottom).putInt(k_b + "t", int(getattr(self, "_last_top", bottom))) \
+                .putString(k_b + "x", str(getattr(self, "_last_prefix", ""))) \
+                .putBoolean(k_end, bool(at_end)).putString(k_new, str(newest))
+        prefs.apply()
+
+    def _save_any(self, chat):
+        """After stock's pause save: keep the bottom row he was reading, also at the very bottom."""
+        if int(self.fields["chatMode"].getInt(chat)) != 0:
+            return
+        if bool(get_private_field(chat, "firstLoading")) or not bool(get_private_field(chat, "firstMessagesLoaded")):
+            return
+        if get_private_field(chat, "currentEncryptedChat") is not None:
+            return
+        place = self._place(chat)
+        if place is None:
+            return
+        tid = int(chat.getTopicId())
+        if tid != 0:
+            mo, v = self._bottom_row(chat)
+            if mo is None or int(mo.getTopicId()) != tid:
+                return
+        self._write(chat, place)
+
     def _keys(self, chat):
         key = str(self.NC.getSharedPrefKey(chat.getDialogId(), chat.getTopicId()))
-        return "diditem" + key, "diditemo" + key, "tsmbottom" + key
+        return "diditem" + key, "diditemo" + key, "tsmbottom" + key, "tsmend" + key, "tsmtail" + key
 
     def _save(self, chat):
-        """Stock's own pause rules, for the topic on screen right now."""
+        """The place of the topic on screen right now, saved on every topic switch (1.1.1: also when the bottom
+        message is on screen; stock drops that, which lost every place in a topic of very tall messages)."""
         if not bool(self.get_setting("enabled", True)):
             return
         if not bool(get_private_field(chat, "isTopic")) or int(chat.getTopicId()) == 0:
@@ -221,28 +665,15 @@ class TopicScrollMemoryPlugin(BasePlugin):
             return
         if not bool(get_private_field(chat, "firstMessagesLoaded")):
             return     # the list is between topics
-        topic = int(chat.getTopicId())
-        mid = 0
-        offset = 0
-        pos = int(lm.findFirstVisibleItemPosition())   # the list is reversed: this is the bottom row
-        if pos > 0 and bool(lv.canScrollVertically(1)):   # at the very bottom = no position (stock)
-            for p in (pos, pos + 1):
-                holder = lv.findViewHolderForAdapterPosition(p)
-                if holder is None:
-                    continue
-                v = holder.itemView
-                mo = v.getMessageObject() if (self.cell_cls.isInstance(v) or self.action_cls.isInstance(v)) else None
-                if mo is not None and int(mo.getId()) > 0 and int(mo.getTopicId()) == topic:
-                    mid = int(mo.getId())
-                    offset = int(v.getBottom()) - int(lv.getMeasuredHeight())
-                    break
-        prefs = self.MC.getNotificationsSettings(int(chat.getCurrentAccount())).edit()
-        k_id, k_off, k_b = self._keys(chat)
-        if mid != 0:
-            prefs.putInt(k_id, mid).putInt(k_off, offset).putInt(k_b, offset + int(lv.getMeasuredHeight()))
-        else:
-            prefs.remove(k_id).remove(k_off).remove(k_b)
-        prefs.apply()
+        place = self._place(chat)
+        if place is not None:
+            mo, v = self._bottom_row(chat)
+            if mo is None or int(mo.getTopicId()) != int(chat.getTopicId()):
+                place = None
+        self._write(chat, place)
+        self._nlog = getattr(self, "_nlog", 0) + 1
+        if self._nlog <= 30:
+            _log("save topic %d: %s" % (int(chat.getTopicId()), str(place)))
 
     def _restore(self, chat):
         """Stock's own open from saved position, for the topic the tab switch just opened."""
@@ -253,7 +684,7 @@ class TopicScrollMemoryPlugin(BasePlugin):
         if int(get_private_field(chat, "clearOnLoadAndScrollMessageId")) >= 0:
             return     # stock already keeps the place (switching from All)
         prefs = self.MC.getNotificationsSettings(int(chat.getCurrentAccount()))
-        k_id, k_off, k_b = self._keys(chat)
+        k_id, k_off, k_b, k_end, k_new = self._keys(chat)
         mid = int(prefs.getInt(k_id, 0))
         if mid <= 0:
             return
@@ -262,7 +693,15 @@ class TopicScrollMemoryPlugin(BasePlugin):
         f["loadingFromOldPosition"].setBoolean(chat, True)
         f["startLoadFromMessageOffset"].setInt(chat, int(prefs.getInt(k_off, 0)))
         f["startLoadFromMessageId"].setInt(chat, mid)
-        bottom = int(prefs.getInt(k_b, -1000000))
         lv = get_private_field(chat, "chatListView")
-        if bottom != -1000000 and lv is not None:
-            lv.getViewTreeObserver().addOnGlobalLayoutListener(_Settle(self, lv, mid, bottom))
+        if lv is None:
+            return
+        bottom = int(prefs.getInt(k_b, -1000000))
+        if bottom == -1000000:
+            bottom = int(prefs.getInt(k_off, 0)) + int(lv.getMeasuredHeight())
+        lv.getViewTreeObserver().addOnGlobalLayoutListener(
+            _Settle(self, chat, lv, mid, bottom, bool(prefs.getBoolean(k_end, False)), str(prefs.getString(k_new, "-")),
+                    int(prefs.getInt(k_b + "t", -1000000)), str(prefs.getString(k_b + "x", ""))))
+        self._nlog = getattr(self, "_nlog", 0) + 1
+        if self._nlog <= 30:
+            _log("restore topic %d at %d" % (int(chat.getTopicId()), mid))
